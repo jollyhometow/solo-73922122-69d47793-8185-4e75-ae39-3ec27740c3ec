@@ -54,6 +54,8 @@ class JobOut(BaseModel):
     finished_at: datetime | None
     deadline: datetime | None
     cancel_requested: bool
+    # 仅取消接口填充：False 表示结论已发布、依法不可取消（成功时保持 succeeded）
+    cancel_accepted: bool | None = None
     error: str | None
     result: ReconcileResult | None
 

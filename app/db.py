@@ -73,7 +73,8 @@ class SnapshotSession:
             self.snapshot_id = row[0] if row else None
             if not self.snapshot_id:
                 raise DbError("pg_export_snapshot() 未返回快照标识")
-            self._snapshot_conn = snap_conn
+            with self._lock:
+                self._snapshot_conn = snap_conn
 
             # 两条独立读取连接，绑定同一快照
             for _ in range(2):
@@ -85,31 +86,41 @@ class SnapshotSession:
                         psycopg.sql.Literal(self.snapshot_id)
                     )
                 )
-                self.readers.append(conn)
+                # 取消请求可能来自控制线程，列表变更同样需要加锁
+                with self._lock:
+                    self.readers.append(conn)
         except Exception:
             self.close()
             raise
 
     def cancel_all(self) -> None:
-        """请求取消所有连接上正在执行的 SQL（可从控制线程调用）。"""
+        """请求取消所有连接上正在执行的 SQL（可从控制线程调用）。
+
+        持锁发送取消请求，确保与 close() 串行：绝不会对正在被释放的
+        pgconn 发送取消。PQcancel 自带独立连接，调用耗时有界。
+        """
         with self._lock:
+            if self._closed:
+                return
             targets: list[psycopg.Connection] = []
             if self._snapshot_conn is not None:
                 targets.append(self._snapshot_conn)
             targets.extend(self.readers)
-        for conn in targets:
-            try:
-                conn.cancel()
-            except Exception:
-                # 连接可能已断开；终止流程由 close/terminate 兜底
-                pass
+            for conn in targets:
+                try:
+                    conn.cancel()
+                except Exception:
+                    # 连接可能已断开；终止流程由 terminate/close 兜底
+                    pass
 
     def terminate_backends(self) -> None:
         """cancel 不生效时的兜底：通过管理员连接 pg_terminate_backend。"""
-        if not self.readers:
+        with self._lock:
+            readers = list(self.readers)
+        if not readers:
             return
         pids: list[int] = []
-        for conn in list(self.readers):
+        for conn in readers:
             try:
                 pids.append(conn.info.backend_pid)
             except Exception:
@@ -133,12 +144,15 @@ class SnapshotSession:
             if self._closed:
                 return
             self._closed = True
-            for conn in self.readers:
-                _quiet_close(conn)
-            if self._snapshot_conn is not None:
-                _quiet_close(self._snapshot_conn)
+            readers = self.readers
+            snapshot_conn = self._snapshot_conn
             self.readers = []
             self._snapshot_conn = None
+        # 锁外关闭连接，避免与 cancel_all 的锁竞争
+        for conn in readers:
+            _quiet_close(conn)
+        if snapshot_conn is not None:
+            _quiet_close(snapshot_conn)
 
 
 def _quiet_close(conn: psycopg.Connection) -> None:

@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from . import db as dbmod
+from .demo import DEMO_LEFT_SQL, DEMO_RIGHT_SQL
 from .manager import SlotBusyError, manager
 from .models import CreateJobRequest, JobOut
 from .sqlvalidation import SqlValidationError
@@ -14,10 +15,40 @@ app = FastAPI(
     description=(
         "提交两条只读 SELECT，基于同一已提交快照并行读取，"
         "按行内容与出现次数做有序多重集核对（忽略行序，NULL≠空串），"
-        "差异最多展示 20 种。单轮 30 秒，全局同时只允许一个任务。"
+        "差异最多展示 20 种。单轮 30 秒，全局同时只允许一个任务。\n\n"
+        "**演示入口**：直接调用 `POST /jobs/demo` 即用内置示例 SQL 发起一轮核对；"
+        "也可展开 `GET /demo/queries` 复制两条 SQL 自行提交。"
     ),
     version="1.0.0",
 )
+
+
+@app.get("/demo/queries", tags=["演示"])
+def demo_queries() -> dict[str, str]:
+    """返回 /docs 演示用的两条等价 SQL，可复制到 POST /jobs 自行提交。"""
+    return {
+        "left_sql": DEMO_LEFT_SQL.strip(),
+        "right_sql": DEMO_RIGHT_SQL.strip(),
+        "note": "两条写法不同、结果应一致；也可直接 POST /jobs/demo。",
+    }
+
+
+@app.post("/jobs/demo", response_model=JobOut, status_code=201, tags=["演示"])
+def create_demo_job() -> JobOut:
+    """用内置示例 SQL 发起一轮核对，便于在 /docs 一键演示完整生命周期。"""
+    try:
+        job = manager.create_job(DEMO_LEFT_SQL, DEMO_RIGHT_SQL, "docs-demo")
+    except SqlValidationError as exc:  # 内置 SQL 不应触发，防御性保留
+        raise HTTPException(status_code=500, detail=f"内置示例 SQL 校验失败：{exc}") from exc
+    except SlotBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "当前已有核对任务在运行，一次只允许一组",
+                "active_job_id": exc.active_job_id,
+            },
+        ) from exc
+    return job.snapshot()
 
 
 @app.get("/health", tags=["运维"])
@@ -60,10 +91,13 @@ def get_job(job_id: str) -> JobOut:
 @app.post("/jobs/{job_id}/cancel", response_model=JobOut, tags=["核对任务"])
 def cancel_job(job_id: str) -> JobOut:
     try:
-        job = manager.request_cancel(job_id)
+        job, accepted = manager.cancel_job_request(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="任务不存在") from exc
-    return job.snapshot()
+    out = job.snapshot()
+    # 结论已经发布（尤其是成功）时明确告知不可取消，任务保持原终态
+    out.cancel_accepted = accepted
+    return out
 
 
 @app.exception_handler(dbmod.DbError)

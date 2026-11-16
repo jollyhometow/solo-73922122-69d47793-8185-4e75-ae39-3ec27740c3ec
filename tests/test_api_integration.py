@@ -154,6 +154,8 @@ def test_slot_busy_returns_409_and_cancel_frees_slot(client: TestClient, monkeyp
     cancelled = client.post(f"/jobs/{job_id}/cancel")
     assert cancelled.json()["cancel_requested"] is True
     assert cancelled.json()["status"] == "cancelling"
+    assert cancelled.json()["cancel_accepted"] is True
+    assert cancelled.json()["result"] is None
 
     out = _wait_terminal(client, job_id, timeout=15)
     assert out["status"] == "cancelled"
@@ -294,6 +296,24 @@ def test_status_query_works_after_terminal(client: TestClient) -> None:
     assert again.json()["status"] == "succeeded"
     listed = client.get("/jobs").json()
     assert any(j["job_id"] == out["job_id"] for j in listed)
+
+
+def test_docs_demo_entrypoint_runs_identical_queries(client: TestClient) -> None:
+    """内置演示入口：/docs 可一键发起，示例两条查询结论一致。"""
+    queries = client.get("/demo/queries")
+    assert queries.status_code == 200
+    assert "left_sql" in queries.json() and "right_sql" in queries.json()
+
+    resp = client.post("/jobs/demo")
+    assert resp.status_code == 201
+    out = _wait_terminal(client, resp.json()["job_id"])
+    assert out["status"] == "succeeded"
+    result = out["result"]
+    assert result["identical"] is True
+    assert result["column_types"] == ["text", "bigint", "bigint"]
+    # 示例数据：3 条产线 × 各自出现的整点小时 = 7 组（A 线 3 组、B/C 线各 2 组）
+    assert result["left_row_total"] == 7
+    assert result["diff_group_total"] == 0
 
 
 def test_missing_job_404(client: TestClient) -> None:
