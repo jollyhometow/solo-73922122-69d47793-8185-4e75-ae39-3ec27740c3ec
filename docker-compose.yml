@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: recon
+      POSTGRES_PASSWORD: recon
+      POSTGRES_DB: recon
+    volumes:
+      # 仅首次启动自动执行初始化 SQL
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recon -d recon"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # 数据库内存不纳入应用 128MiB 约束；本地演示可按需调小
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=50"
+      - "-c"
+      - "work_mem=4MB"
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_DSN: postgresql://recon:recon@postgres:5432/recon
+      JOB_TIMEOUT_SECONDS: "30"
+      SORT_CHUNK_ROWS: "20000"
+      MAX_DIFF_TYPES: "20"
+      WORK_DIR: /tmp/recon-work
+      PG_STATEMENT_TIMEOUT_MS: "28000"
+    ports:
+      - "8000:8000"
+    volumes:
+      # 外部排序暂存：独立卷，任务结束即清空，不占容器可写层
+      - reconwork:/tmp/recon-work
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    mem_limit: 128m
+    mem_reservation: 96m
+
+volumes:
+  pgdata:
+  reconwork:
